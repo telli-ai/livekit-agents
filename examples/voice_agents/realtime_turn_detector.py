@@ -3,9 +3,9 @@ import logging
 from dotenv import load_dotenv
 from google.genai import types  # noqa: F401
 
-from livekit.agents import Agent, AgentSession, JobContext, JobProcess, WorkerOptions, cli
-from livekit.plugins import deepgram, google, openai, silero  # noqa: F401
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.plugins import openai
+from livekit.plugins.openai.realtime.realtime_model import RealtimeCustomVoice  # noqa: F401
 
 logger = logging.getLogger("realtime-turn-detector")
 logger.setLevel(logging.INFO)
@@ -21,16 +21,13 @@ load_dotenv()
 async def entrypoint(ctx: JobContext):
     session = AgentSession(
         allow_interruptions=True,
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        stt=deepgram.STT(),
         # To use OpenAI Realtime API
         llm=openai.realtime.RealtimeModel(
-            voice="alloy",
+            voice=RealtimeCustomVoice(id="voice_68efbce1405c8191be643acc225dec05"),
             # it's necessary to turn off turn detection in the OpenAI Realtime API in order to use
             # LiveKit's turn detection model
-            turn_detection=None,
-            input_audio_transcription=None,  # we use Deepgram STT instead
+            # turn_detection=None,
+            # input_audio_transcription=None,  # we use Deepgram STT instead
         ),
         # To use Gemini Live API
         # llm=google.realtime.RealtimeModel(
@@ -45,9 +42,5 @@ async def entrypoint(ctx: JobContext):
     await session.start(agent=Agent(instructions="You are a helpful assistant."), room=ctx.room)
 
 
-def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
-
-
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

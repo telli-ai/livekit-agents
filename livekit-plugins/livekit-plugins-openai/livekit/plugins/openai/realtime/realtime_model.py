@@ -124,7 +124,7 @@ lk_oai_debug = int(os.getenv("LK_OPENAI_DEBUG", 0))
 @dataclass
 class _RealtimeOptions:
     model: str
-    voice: str
+    voice: str | RealtimeCustomVoice
     tool_choice: llm.ToolChoice | None
     input_audio_transcription: AudioTranscription | None
     input_audio_noise_reduction: NoiseReduction | None
@@ -167,13 +167,18 @@ class _ResponseGeneration:
     """timestamp when the first token was received"""
 
 
+@dataclass
+class RealtimeCustomVoice:
+    id: str
+
+
 class RealtimeModel(llm.RealtimeModel):
     @overload
     def __init__(
         self,
         *,
         model: RealtimeModels | str = "gpt-realtime",
-        voice: str = DEFAULT_VOICE,
+        voice: str | RealtimeCustomVoice = DEFAULT_VOICE,
         modalities: NotGivenOr[list[Literal["text", "audio"]]] = NOT_GIVEN,
         input_audio_transcription: NotGivenOr[
             AudioTranscription | InputAudioTranscription | None
@@ -204,7 +209,7 @@ class RealtimeModel(llm.RealtimeModel):
         api_key: str | None = None,
         api_version: str | None = None,
         base_url: NotGivenOr[str] = NOT_GIVEN,
-        voice: str = DEFAULT_VOICE,
+        voice: str | RealtimeCustomVoice = DEFAULT_VOICE,
         modalities: NotGivenOr[list[Literal["text", "audio"]]] = NOT_GIVEN,
         input_audio_transcription: NotGivenOr[
             AudioTranscription | InputAudioTranscription | None
@@ -228,7 +233,7 @@ class RealtimeModel(llm.RealtimeModel):
         self,
         *,
         model: str = "gpt-realtime",
-        voice: str = DEFAULT_VOICE,
+        voice: str | RealtimeCustomVoice = DEFAULT_VOICE,
         modalities: NotGivenOr[list[Literal["text", "audio"]]] = NOT_GIVEN,
         tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN,
@@ -989,7 +994,7 @@ class RealtimeSession(
                     transcription=self._realtime_model._opts.input_audio_transcription,
                     turn_detection=self._realtime_model._opts.turn_detection,
                 ),
-                output=RealtimeAudioConfigOutput(
+                output=RealtimeAudioConfigOutput.construct(
                     format=audio_format,
                     speed=self._realtime_model._opts.speed,
                     voice=self._realtime_model._opts.voice,
@@ -1023,7 +1028,7 @@ class RealtimeSession(
         self,
         *,
         tool_choice: NotGivenOr[llm.ToolChoice | None] = NOT_GIVEN,
-        voice: NotGivenOr[str] = NOT_GIVEN,
+        voice: NotGivenOr[str | RealtimeCustomVoice] = NOT_GIVEN,
         turn_detection: NotGivenOr[RealtimeAudioInputTurnDetection | None] = NOT_GIVEN,
         max_response_output_tokens: NotGivenOr[int | Literal["inf"] | None] = NOT_GIVEN,
         input_audio_transcription: NotGivenOr[AudioTranscription | None] = NOT_GIVEN,
@@ -1064,7 +1069,7 @@ class RealtimeSession(
 
         if is_given(voice):
             self._realtime_model._opts.voice = voice
-            audio_output.voice = voice
+            audio_output.voice = voice  # type: ignore
             has_audio_config = True
 
         if is_given(turn_detection):
@@ -1094,7 +1099,7 @@ class RealtimeSession(
 
         if has_changes:
             self.send_event(
-                SessionUpdateEvent(
+                SessionUpdateEvent.construct(
                     type="session.update",
                     session=session,
                     event_id=utils.shortuuid("options_update_"),
