@@ -255,3 +255,272 @@ async def test_recv_loop_ignores_flush_done_for_inactive_context() -> None:
     assert connection.emitter.audio_chunks == [audio_chunk]
     assert connection.waiter.done()
     assert connection.waiter.result() is None
+
+
+class _FakeDialogueWebSocket:
+    def __init__(self, messages: list[object] | None = None) -> None:
+        self._messages = list(messages or [])
+        self.closed = False
+        self.close_code: int | None = None
+        self.sent: list[dict[str, object]] = []
+
+    async def receive(self) -> object:
+        if self._messages:
+            return self._messages.pop(0)
+        return SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, data="")
+
+    async def send_json(self, data: dict[str, object]) -> None:
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _make_dialogue_connection(
+    messages: list[object] | None = None,
+    **tts_kwargs: object,
+) -> tuple["elevenlabs_tts._DialogueConnection", _FakeDialogueWebSocket]:
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3_conversational", **tts_kwargs)
+    connection = elevenlabs_tts._DialogueConnection(  # pyright: ignore[reportPrivateUsage]
+        tts._opts, None
+    )
+    ws = _FakeDialogueWebSocket(messages)
+    connection._ws = ws
+    return connection, ws
+
+
+async def _make_dialogue_turn(
+    connection: "elevenlabs_tts._DialogueConnection",
+    *,
+    stream: object | None = None,
+) -> "elevenlabs_tts._DialogueTurn":
+    emitter = _FakeEmitter()
+    waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+    return await connection.start_turn(emitter=emitter, stream=stream, waiter=waiter, timeout=5.0)
+
+
+def test_v3_models_route_to_dialogue() -> None:
+    assert elevenlabs_tts._is_dialogue_model("eleven_v3")
+    assert elevenlabs_tts._is_dialogue_model("eleven_v3_conversational")
+    assert not elevenlabs_tts._is_dialogue_model("eleven_turbo_v2_5")
+    assert not elevenlabs_tts._is_dialogue_model("eleven_flash_v2_5")
+
+
+def test_dialogue_stream_url_includes_expected_params() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3_conversational", language="de")
+    url = elevenlabs_tts._dialogue_stream_url(tts._opts)  # pyright: ignore[reportPrivateUsage]
+
+    assert url.startswith("wss://api.elevenlabs.io/v1/text-to-dialogue/stream-input?")
+    assert "model_id=eleven_v3_conversational" in url
+    assert "output_format=mp3_22050_32" in url
+    assert "language_code=de" in url
+    assert "sync_alignment=true" in url
+
+
+def test_dialogue_stream_url_omits_language_when_not_set() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3", sync_alignment=False)
+    url = elevenlabs_tts._dialogue_stream_url(tts._opts)  # pyright: ignore[reportPrivateUsage]
+
+    assert "language_code" not in url
+    assert "sync_alignment" not in url
+
+
+def test_build_dialogue_init_packet_voices_are_plain_strings() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3", voice_id="voice-1")
+    packet = elevenlabs_tts._build_dialogue_init_packet(  # pyright: ignore[reportPrivateUsage]
+        tts._opts
+    )
+
+    assert packet["voices"] == ["voice-1"]
+    assert "voice_settings" not in packet
+
+
+def test_build_dialogue_init_packet_includes_voice_settings_when_given() -> None:
+    tts = elevenlabs_tts.TTS(
+        api_key="test-key",
+        model="eleven_v3",
+        voice_settings=elevenlabs_tts.VoiceSettings(stability=0.5, similarity_boost=0.8),
+    )
+    packet = elevenlabs_tts._build_dialogue_init_packet(  # pyright: ignore[reportPrivateUsage]
+        tts._opts
+    )
+
+    assert packet["voice_settings"] == {"stability": 0.5, "similarity_boost": 0.8}
+
+
+def test_build_dialogue_init_packet_includes_pronunciation_dictionaries() -> None:
+    tts = elevenlabs_tts.TTS(
+        api_key="test-key",
+        model="eleven_v3",
+        pronunciation_dictionary_locators=[
+            elevenlabs_tts.PronunciationDictionaryLocator(
+                pronunciation_dictionary_id="dict-1",
+                version_id="v1",
+            )
+        ],
+    )
+    packet = elevenlabs_tts._build_dialogue_init_packet(  # pyright: ignore[reportPrivateUsage]
+        tts._opts
+    )
+
+    assert packet["pronunciation_dictionary_locators"] == [
+        {
+            "pronunciation_dictionary_id": "dict-1",
+            "version_id": "v1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_send_text_flags_new_turn_only_on_first_input() -> None:
+    connection, ws = _make_dialogue_connection()
+    turn = await _make_dialogue_turn(connection)
+
+    await connection.send_text(turn, "Hello there. ")
+    await connection.send_text(turn, "Second sentence. ")
+
+    first, second = ws.sent
+    assert first["inputs"][0]["new_turn"] is True
+    assert second["inputs"][0]["new_turn"] is False
+
+
+@pytest.mark.asyncio
+async def test_dialogue_empty_flush_is_not_sent() -> None:
+    connection, ws = _make_dialogue_connection()
+    turn = await _make_dialogue_turn(connection)
+
+    await connection.flush_turn(turn)
+    assert ws.sent == []
+    assert turn.flushes_sent == 0
+
+    await connection.send_text(turn, "Hello. ")
+    await connection.flush_turn(turn)
+    assert ws.sent[-1] == {"flush": True}
+    assert turn.flushes_sent == 1
+
+    await connection.flush_turn(turn)
+    assert turn.flushes_sent == 1
+
+
+@pytest.mark.asyncio
+async def test_dialogue_recv_loop_routes_audio_and_completes_on_marker() -> None:
+    audio_chunk = b"dialogue-audio"
+    connection, ws = _make_dialogue_connection(
+        [
+            _websocket_text_message({"audio": base64.b64encode(audio_chunk).decode("ascii")}),
+            _websocket_text_message({"is_final_audio_for_turn": True}),
+        ]
+    )
+    turn = await _make_dialogue_turn(connection)
+    turn.flushes_sent = 1
+    turn.input_done = True
+
+    await connection._recv_loop()
+
+    assert turn.emitter.audio_chunks == [audio_chunk]  # type: ignore[attr-defined]
+    assert turn.waiter.done()
+    assert turn.waiter.result() is None
+
+
+@pytest.mark.asyncio
+async def test_dialogue_recv_loop_waits_for_all_flush_markers() -> None:
+    connection, ws = _make_dialogue_connection(
+        [
+            _websocket_text_message({"is_final_audio_for_turn": True}),
+            _websocket_text_message({"is_final_audio_for_turn": True}),
+        ]
+    )
+    turn = await _make_dialogue_turn(connection)
+    turn.flushes_sent = 2
+    turn.input_done = True
+
+    async def _recv_one() -> None:
+        msg = await ws.receive()
+        data = json.loads(msg.data)  # type: ignore[attr-defined]
+        if data.get("is_final_audio_for_turn"):
+            turn.markers_received += 1
+            connection._maybe_complete_turn(turn)
+
+    await _recv_one()
+    assert not turn.waiter.done()
+
+    await _recv_one()
+    assert turn.waiter.done()
+    assert turn.waiter.result() is None
+
+
+@pytest.mark.asyncio
+async def test_dialogue_recv_loop_parses_snake_case_alignment() -> None:
+    audio_chunk = b"aligned-audio"
+    connection, ws = _make_dialogue_connection(
+        [
+            _websocket_text_message(
+                {
+                    "audio": base64.b64encode(audio_chunk).decode("ascii"),
+                    "normalized_alignment": {
+                        "chars": ["h", "e", "y", " ", "n", "o", "w"],
+                        "char_start_times_ms": [0, 10, 20, 30, 40, 50, 60],
+                        "char_durations_ms": [10, 10, 10, 10, 10, 10, 10],
+                    },
+                }
+            ),
+            _websocket_text_message({"is_final_audio_for_turn": True}),
+        ]
+    )
+    stream = _FakeStream()
+    turn = await _make_dialogue_turn(connection, stream=stream)
+    turn.flushes_sent = 1
+    turn.input_done = True
+
+    await connection._recv_loop()
+
+    assert turn.emitter.audio_chunks == [audio_chunk]  # type: ignore[attr-defined]
+    assert turn.emitter.timed_transcript_pushes > 0  # type: ignore[attr-defined]
+    assert stream._text_buffer != ""
+    assert turn.waiter.done()
+
+
+@pytest.mark.asyncio
+async def test_dialogue_recv_loop_idle_timeout_without_turn_is_benign() -> None:
+    connection, ws = _make_dialogue_connection(
+        [
+            _websocket_text_message(
+                {
+                    "message": "No message received within 20s.",
+                    "error": "input_timeout_exceeded",
+                    "code": 1008,
+                }
+            ),
+        ]
+    )
+
+    await connection._recv_loop()
+
+    assert connection._closed
+    assert ws.closed
+
+
+@pytest.mark.asyncio
+async def test_dialogue_recv_loop_audio_without_turn_closes_connection() -> None:
+    connection, ws = _make_dialogue_connection(
+        [
+            _websocket_text_message({"audio": base64.b64encode(b"stale-audio").decode("ascii")}),
+        ]
+    )
+
+    await connection._recv_loop()
+
+    assert connection._closed
+    assert ws.closed
+
+
+@pytest.mark.asyncio
+async def test_dialogue_recv_loop_close_with_active_turn_sets_error() -> None:
+    connection, ws = _make_dialogue_connection([])
+    ws.close_code = 1008
+    turn = await _make_dialogue_turn(connection)
+
+    await connection._recv_loop()
+
+    assert turn.waiter.done()
+    assert isinstance(turn.waiter.exception(), elevenlabs_tts.APIStatusError)
