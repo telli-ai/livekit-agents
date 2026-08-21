@@ -1179,6 +1179,7 @@ class _DialogueConnection:
         self._recv_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._closed_done = asyncio.Event()
         self._last_activity = 0.0
 
     @property
@@ -1219,8 +1220,11 @@ class _DialogueConnection:
             # a failed or cancelled init send must not leak the fresh websocket
             self._closed = True
             ws, self._ws = self._ws, None
-            with contextlib.suppress(BaseException):
-                await asyncio.shield(ws.close())
+            try:
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(ws.close())
+            finally:
+                self._closed_done.set()
             raise
         self._last_activity = asyncio.get_event_loop().time()
 
@@ -1481,27 +1485,35 @@ class _DialogueConnection:
     async def aclose(self) -> None:
         """Close the connection and clean up"""
         if self._closed:
+            # another task started the close; join its cleanup instead of treating
+            # the flag as proof that cleanup already finished. The recv/keep-alive
+            # finallys skip aclose() once _closed is set, so nothing here can end
+            # up waiting on its own completion.
+            await self._closed_done.wait()
             return
 
         self._closed = True
 
-        turn = self._turn
-        if turn is not None:
-            if not turn.waiter.done():
-                turn.waiter.set_exception(APIStatusError("connection closed"))
-            if turn.timeout_timer:
-                turn.timeout_timer.cancel()
-        self._turn = None
+        try:
+            turn = self._turn
+            if turn is not None:
+                if not turn.waiter.done():
+                    turn.waiter.set_exception(APIStatusError("connection closed"))
+                if turn.timeout_timer:
+                    turn.timeout_timer.cancel()
+            self._turn = None
 
-        if self._ws:
-            await self._ws.close()
+            if self._ws:
+                await self._ws.close()
 
-        current = asyncio.current_task()
-        for task in (self._recv_task, self._keepalive_task):
-            if task is not None and task is not current:
-                await utils.aio.gracefully_cancel(task)
+            current = asyncio.current_task()
+            for task in (self._recv_task, self._keepalive_task):
+                if task is not None and task is not current:
+                    await utils.aio.gracefully_cancel(task)
 
-        self._ws = None
+            self._ws = None
+        finally:
+            self._closed_done.set()
 
 
 async def _acquire_dialogue_connection(

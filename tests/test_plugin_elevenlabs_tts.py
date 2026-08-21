@@ -765,3 +765,26 @@ async def test_dialogue_start_turn_rejects_superseded_connection() -> None:
         await connection.start_turn(emitter=_FakeEmitter(), stream=None, waiter=waiter, timeout=1.0)
 
     assert not connection._turn_lock.locked()  # the failed start released the lock
+
+
+@pytest.mark.asyncio
+async def test_dialogue_concurrent_aclose_joins_in_progress_close() -> None:
+    connection, ws = _make_dialogue_connection()
+    release = asyncio.Event()
+
+    async def _slow_close() -> None:
+        await release.wait()
+        ws.closed = True
+
+    ws.close = _slow_close  # type: ignore[method-assign]
+
+    first = asyncio.create_task(connection.aclose())
+    await asyncio.sleep(0)
+    second = asyncio.create_task(connection.aclose())
+    await asyncio.sleep(0)
+    assert not second.done()  # must join the in-progress cleanup, not return early
+
+    release.set()
+    await first
+    await second
+    assert ws.closed
