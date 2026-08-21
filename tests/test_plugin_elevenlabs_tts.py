@@ -569,3 +569,22 @@ async def test_dialogue_stall_timer_armed_until_final_marker() -> None:
     assert turn.waiter.done()
     assert turn.waiter.result() is None
     connection.finish_turn(turn)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_discard_during_shutdown_skips_prewarm() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3_conversational")
+    connection = elevenlabs_tts._DialogueConnection(  # pyright: ignore[reportPrivateUsage]
+        tts._opts, None
+    )
+    ws = _FakeDialogueWebSocket()
+    connection._ws = ws
+
+    tts._closing = True
+    tts._discard_dialogue_connection(connection)
+
+    assert tts._prewarm_task is None  # shutdown must not schedule a replacement
+    assert connection._close_task is not None
+    await connection._close_task
+    assert connection._closed
+    assert ws.closed

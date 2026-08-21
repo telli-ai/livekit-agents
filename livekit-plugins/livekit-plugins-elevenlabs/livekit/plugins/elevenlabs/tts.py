@@ -222,6 +222,7 @@ class TTS(tts.TTS):
         self._connection_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._prewarm_task: asyncio.Task[None] | None = None
+        self._closing = False
 
     @property
     def model(self) -> str:
@@ -297,6 +298,9 @@ class TTS(tts.TTS):
             Tuple of (connection, acquire_time, connection_reused)
         """
         async with self._connection_lock:
+            if self._closing:
+                raise APIConnectionError("TTS instance is closed", retryable=False)
+
             if (
                 self.__current_connection
                 and self.__current_connection.is_current
@@ -325,6 +329,9 @@ class TTS(tts.TTS):
         if self.__current_connection is connection:
             self.__current_connection = None
         connection.mark_non_current()  # spawns the close now that the turn is released
+        if self._closing:
+            # a stream woken by shutdown must not schedule a replacement connection
+            return
         if self._prewarm_task is not None and not self._prewarm_task.done():
             self._prewarm_task.cancel()
         self._prewarm_task = asyncio.create_task(self._prewarm_dialogue())
@@ -352,6 +359,8 @@ class TTS(tts.TTS):
         return stream
 
     async def aclose(self) -> None:
+        self._closing = True
+
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
