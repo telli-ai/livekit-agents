@@ -753,3 +753,15 @@ async def test_dialogue_send_times_out_when_write_stalls() -> None:
         await connection.send_text(turn, "Hello. ")
 
     connection.finish_turn(turn)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_start_turn_rejects_superseded_connection() -> None:
+    connection, ws = _make_dialogue_connection()
+    connection._is_current = False  # superseded, but not yet closed
+
+    waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+    with pytest.raises(elevenlabs_tts.APIConnectionError):
+        await connection.start_turn(emitter=_FakeEmitter(), stream=None, waiter=waiter, timeout=1.0)
+
+    assert not connection._turn_lock.locked()  # the failed start released the lock

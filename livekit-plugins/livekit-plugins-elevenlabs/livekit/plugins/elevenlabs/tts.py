@@ -1128,6 +1128,35 @@ class _DialogueConnection:
     connection is reused across consecutive synthesis turns and kept open with
     ``keep_alive`` messages (the server idles out after ~20s otherwise);
     interruption closes the socket (see ``TTS._discard_dialogue_connection``).
+
+    Lifecycle invariants (three actors touch shared state - requests,
+    ``update_options()``, and ``aclose()`` - so every rule below matters):
+
+    1. Publish: a connection becomes the TTS instance's current connection only
+       inside ``_connection_lock``, and only if the instance is not closing and
+       ``_opts_generation`` is unchanged since before its construction, both
+       re-checked after the handshake await. A published connection therefore
+       always matches the live options.
+    2. Supersede: whoever makes a connection non-current triggers its close -
+       ``mark_non_current`` closes it when idle, ``finish_turn`` closes it after
+       the active turn drains, and the keep-alive loop is the backstop for the
+       no-running-loop edge of ``mark_non_current``.
+    3. Close: ``aclose`` is idempotent; discard closes are spawned through the
+       owner's tracked background set so an acquisition timeout can never cancel
+       one halfway, and ``TTS.aclose`` awaits them (plus a second sweep for
+       closes spawned by streams woken during shutdown).
+    4. Turns: the ``_turn_lock`` holder owns the turn and always calls
+       ``finish_turn`` exactly once from its ``finally``; turns never start on a
+       closed or superseded connection; every waiter-resolution path checks
+       ``waiter.done()`` first.
+    5. Bounded waits: connection acquisition, turn-lock acquisition, and every
+       websocket write are bounded by the request timeout; a timer bounds the
+       wait for first audio, and after input ends a stall timer (re-armed per
+       audio message) bounds the wait for the final marker.
+
+    Mutations of the current-connection slot happen either under
+    ``_connection_lock`` or in synchronous methods with no await between check
+    and write, which is equivalent on a single event loop.
     """
 
     def __init__(
@@ -1213,7 +1242,10 @@ class _DialogueConnection:
             raise APITimeoutError(
                 f"timed out waiting for the active dialogue turn after {timeout} seconds"
             ) from e
-        if self._closed or not self._ws or self._ws.closed:
+        if self._closed or not self._is_current or not self._ws or self._ws.closed:
+            # a superseded connection embodies stale options and closes as soon as it
+            # drains; failing here lets the retry acquire a fresh one instead of
+            # sending a turn to a socket that is about to disappear
             self._turn_lock.release()
             raise APIConnectionError("dialogue websocket connection is closed")
 
