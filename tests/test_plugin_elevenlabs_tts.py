@@ -588,3 +588,30 @@ async def test_dialogue_discard_during_shutdown_skips_prewarm() -> None:
     await connection._close_task
     assert connection._closed
     assert ws.closed
+
+
+@pytest.mark.asyncio
+async def test_dialogue_connection_not_published_when_closed_mid_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = elevenlabs_tts.TTS(
+        api_key="test-key",
+        model="eleven_v3_conversational",
+        http_session=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    closed: list[bool] = []
+
+    async def _connect(self: object) -> None:
+        tts._closing = True  # aclose() begins while the handshake is in flight
+
+    async def _aclose(self: object) -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(elevenlabs_tts._DialogueConnection, "connect", _connect)
+    monkeypatch.setattr(elevenlabs_tts._DialogueConnection, "aclose", _aclose)
+
+    with pytest.raises(elevenlabs_tts.APIConnectionError):
+        await tts._current_connection()
+
+    assert closed == [True]
+    assert tts._TTS__current_connection is None  # type: ignore[attr-defined]

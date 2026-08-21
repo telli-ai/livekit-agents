@@ -317,6 +317,13 @@ class TTS(tts.TTS):
             t0 = time.perf_counter()
             await conn.connect()
             acquire_time = time.perf_counter() - t0
+
+            if self._closing:
+                # aclose() may have run while the handshake was in flight; close the
+                # fresh connection instead of publishing it on a closed instance
+                await conn.aclose()
+                raise APIConnectionError("TTS instance is closed", retryable=False)
+
             self.__current_connection = conn
             return conn, acquire_time, False
 
