@@ -529,8 +529,13 @@ class SynthesizeStream(tts.SynthesizeStream):
             raise APIConnectionError("could not connect to ElevenLabs") from e
 
         if not isinstance(conn, _Connection):
-            # the model was switched concurrently; the retry loop will pick the right path
-            raise APIConnectionError("connection type changed while starting synthesis")
+            # update_options() switched the model family while this request was starting; the
+            # request keeps its snapshotted model, so retrying can never match - fail fast
+            raise APIConnectionError(
+                "model family changed while starting synthesis; create a new stream after "
+                "switching between eleven_v3 and other models",
+                retryable=False,
+            )
         connection: _Connection = conn
 
         waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
@@ -1362,8 +1367,13 @@ async def _acquire_dialogue_connection(
         raise APIConnectionError("could not connect to ElevenLabs") from e
 
     if not isinstance(connection, _DialogueConnection):
-        # the model was switched concurrently; the retry loop will pick the right path
-        raise APIConnectionError("connection type changed while starting synthesis")
+        # update_options() switched the model family while this request was starting; the
+        # request keeps its snapshotted model, so retrying can never match - fail fast
+        raise APIConnectionError(
+            "model family changed while starting synthesis; create a new stream after "
+            "switching between eleven_v3 and other models",
+            retryable=False,
+        )
     return connection, acquire_time, reused
 
 
