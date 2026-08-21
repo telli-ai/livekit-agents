@@ -223,6 +223,7 @@ class TTS(tts.TTS):
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._prewarm_task: asyncio.Task[None] | None = None
         self._closing = False
+        self._opts_generation = 0
 
     @property
     def model(self) -> str:
@@ -287,9 +288,11 @@ class TTS(tts.TTS):
             self._opts.pronunciation_dictionary_locators = pronunciation_dictionary_locators
             changed = True
 
-        if changed and self.__current_connection:
-            self.__current_connection.mark_non_current()
-            self.__current_connection = None
+        if changed:
+            self._opts_generation += 1
+            if self.__current_connection:
+                self.__current_connection.mark_non_current()
+                self.__current_connection = None
 
     async def _current_connection(self) -> tuple[_Connection | _DialogueConnection, float, bool]:
         """Get the current connection, creating one if needed.
@@ -309,6 +312,7 @@ class TTS(tts.TTS):
                 return self.__current_connection, 0.0, True
 
             session = self._ensure_session()
+            generation = self._opts_generation
             conn: _Connection | _DialogueConnection
             if _is_dialogue_model(self._opts.model):
                 conn = _DialogueConnection(self._opts, session, spawn=self._spawn_background)
@@ -324,12 +328,13 @@ class TTS(tts.TTS):
                 await conn.aclose()
                 raise APIConnectionError("TTS instance is closed", retryable=False)
 
-            if isinstance(conn, _DialogueConnection) != _is_dialogue_model(self._opts.model):
-                # update_options() switched the model family during the handshake and
-                # could not mark the unpublished connection non-current; publishing it
-                # would wedge every subsequent stream on a wrong-protocol connection
+            if generation != self._opts_generation:
+                # update_options() ran during the handshake and could not mark the
+                # unpublished connection non-current; its URL and init message were
+                # built from the stale options (this also covers model-family
+                # switches). Discard it; the retry rebuilds from current options.
                 await conn.aclose()
-                raise APIConnectionError("model family changed while connecting")
+                raise APIConnectionError("options changed while connecting")
 
             self.__current_connection = conn
             return conn, acquire_time, False
