@@ -1305,18 +1305,23 @@ class _DialogueConnection:
     async def _send_json(self, data: dict[str, Any], *, timeout: float | None = None) -> None:
         if self._closed or not self._ws or self._ws.closed:
             raise APIConnectionError("dialogue websocket connection is closed")
-        async with self._send_lock:
-            if timeout is None:
-                await self._ws.send_json(data)
-                return
-            try:
-                # a write stalled by transport backpressure must not hold the turn
-                # forever; the resulting error discards the connection
-                await asyncio.wait_for(self._ws.send_json(data), timeout)
-            except asyncio.TimeoutError as e:
-                raise APITimeoutError(
-                    f"11labs dialogue send stalled after {timeout} seconds"
-                ) from e
+        ws = self._ws
+
+        async def _locked_send() -> None:
+            async with self._send_lock:
+                await ws.send_json(data)
+
+        if timeout is None:
+            await _locked_send()
+            return
+        try:
+            # bound the lock acquisition and the write together: a backpressured
+            # writer holding the lock must not extend another turn's budget, and a
+            # stalled write must not hold the turn forever; the resulting error
+            # discards the connection
+            await asyncio.wait_for(_locked_send(), timeout)
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError(f"11labs dialogue send stalled after {timeout} seconds") from e
 
     def _maybe_complete_turn(self, turn: _DialogueTurn) -> None:
         if not turn.input_done or turn.markers_received < turn.flushes_sent:
