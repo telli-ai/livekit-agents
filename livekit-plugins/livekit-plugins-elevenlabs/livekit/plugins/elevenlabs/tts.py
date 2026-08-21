@@ -22,7 +22,7 @@ import json
 import os
 import time
 import weakref
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any, Literal
@@ -221,6 +221,7 @@ class TTS(tts.TTS):
         self.__current_connection: _Connection | _DialogueConnection | None = None
         self._connection_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._prewarm_task: asyncio.Task[None] | None = None
 
     @property
     def model(self) -> str:
@@ -306,7 +307,7 @@ class TTS(tts.TTS):
             session = self._ensure_session()
             conn: _Connection | _DialogueConnection
             if _is_dialogue_model(self._opts.model):
-                conn = _DialogueConnection(self._opts, session)
+                conn = _DialogueConnection(self._opts, session, spawn=self._spawn_background)
             else:
                 conn = _Connection(self._opts, session)
             t0 = time.perf_counter()
@@ -321,20 +322,22 @@ class TTS(tts.TTS):
         Closing the socket is the only way to stop in-flight v3 synthesis, so this is
         the interruption path; the background reconnect keeps the next turn warm.
         """
-        connection.mark_non_current()
         if self.__current_connection is connection:
             self.__current_connection = None
-        self._spawn_background(connection.aclose())
-        self._spawn_background(self._prewarm_dialogue())
+        connection.mark_non_current()  # spawns the close now that the turn is released
+        if self._prewarm_task is not None and not self._prewarm_task.done():
+            self._prewarm_task.cancel()
+        self._prewarm_task = asyncio.create_task(self._prewarm_dialogue())
 
     async def _prewarm_dialogue(self) -> None:
         with contextlib.suppress(Exception):
             await self._current_connection()
 
-    def _spawn_background(self, coro: Coroutine[Any, Any, Any]) -> None:
+    def _spawn_background(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[None]:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -353,8 +356,14 @@ class TTS(tts.TTS):
             await stream.aclose()
         self._streams.clear()
 
-        for task in list(self._background_tasks):
-            task.cancel()
+        if self._prewarm_task is not None:
+            self._prewarm_task.cancel()
+
+        # connection close tasks must complete, not be cancelled: a close interrupted
+        # after it marks the connection closed would leave the websocket and its
+        # recv/keep-alive tasks alive past shutdown
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
 
         if self.__current_connection:
             await self.__current_connection.aclose()
@@ -1067,9 +1076,17 @@ class _DialogueConnection:
     interruption closes the socket (see ``TTS._discard_dialogue_connection``).
     """
 
-    def __init__(self, opts: _TTSOptions, session: aiohttp.ClientSession):
+    def __init__(
+        self,
+        opts: _TTSOptions,
+        session: aiohttp.ClientSession,
+        *,
+        spawn: Callable[[Coroutine[Any, Any, Any]], asyncio.Task[None]] | None = None,
+    ):
         self._opts = opts
         self._session = session
+        # owner-provided task spawner so close tasks can be awaited at TTS shutdown
+        self._spawn = spawn
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._is_current = True
         self._closed = False
@@ -1102,7 +1119,8 @@ class _DialogueConnection:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return  # no running loop; the keep-alive loop closes it instead
-        self._close_task = loop.create_task(self.aclose())
+        coro = self.aclose()
+        self._close_task = self._spawn(coro) if self._spawn is not None else loop.create_task(coro)
 
     async def connect(self) -> None:
         """Establish the WebSocket, send the init message, and start recv/keep-alive loops"""
@@ -1167,6 +1185,11 @@ class _DialogueConnection:
         await self.flush_turn(turn)
         turn.input_done = True
         self._maybe_complete_turn(turn)
+        if not turn.waiter.done():
+            # from here on audio must keep flowing until the final marker; without this
+            # the client keep_alive defeats the server idle close and a stall would
+            # hang the turn forever
+            self._arm_stall_timer(turn)
 
     def finish_turn(self, turn: _DialogueTurn) -> None:
         """Release the connection; always called by the turn holder when its run ends"""
@@ -1219,6 +1242,21 @@ class _DialogueConnection:
                 )
 
         turn.timeout_timer = asyncio.get_event_loop().call_later(turn.timeout, _on_timeout)
+
+    def _arm_stall_timer(self, turn: _DialogueTurn) -> None:
+        """After input ends, time out if audio stops flowing before the final marker"""
+        if turn.timeout_timer:
+            turn.timeout_timer.cancel()
+
+        def _on_stall() -> None:
+            if not turn.waiter.done():
+                turn.waiter.set_exception(
+                    APITimeoutError(
+                        f"11labs tts stalled after input end ({turn.timeout} seconds without audio)"
+                    )
+                )
+
+        turn.timeout_timer = asyncio.get_event_loop().call_later(turn.timeout, _on_stall)
 
     async def _recv_loop(self) -> None:
         """Receive loop - routes audio, alignment, and turn markers to the active turn"""
@@ -1274,6 +1312,8 @@ class _DialogueConnection:
                     turn.emitter.push(base64.b64decode(data["audio"]))
                     if turn.timeout_timer:
                         turn.timeout_timer.cancel()
+                    if turn.input_done and not turn.waiter.done():
+                        self._arm_stall_timer(turn)
 
                 if turn is not None and turn.stream is not None:
                     alignment = (

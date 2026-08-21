@@ -551,3 +551,21 @@ async def test_dialogue_finish_turn_closes_non_current_connection() -> None:
     await connection._close_task
     assert connection._closed
     assert ws.closed
+
+
+@pytest.mark.asyncio
+async def test_dialogue_stall_timer_armed_until_final_marker() -> None:
+    connection, ws = _make_dialogue_connection()
+    turn = await _make_dialogue_turn(connection)
+
+    await connection.send_text(turn, "Hello. ")
+    await connection.end_turn_input(turn)
+
+    assert not turn.waiter.done()
+    assert turn.timeout_timer is not None  # stall timer stays armed until the final marker
+
+    turn.markers_received += 1
+    connection._maybe_complete_turn(turn)
+    assert turn.waiter.done()
+    assert turn.waiter.result() is None
+    connection.finish_turn(turn)
