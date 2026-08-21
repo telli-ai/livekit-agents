@@ -216,7 +216,7 @@ class TTS(tts.TTS):
             pronunciation_dictionary_locators=pronunciation_dictionary_locators,
         )
         self._session = http_session
-        self._streams = weakref.WeakSet[SynthesizeStream]()
+        self._streams = weakref.WeakSet[SynthesizeStream | ChunkedStream]()
 
         self.__current_connection: _Connection | _DialogueConnection | None = None
         self._connection_lock = asyncio.Lock()
@@ -363,7 +363,9 @@ class TTS(tts.TTS):
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
     ) -> ChunkedStream:
-        return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+        stream = ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+        self._streams.add(stream)
+        return stream
 
     def stream(
         self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -1153,7 +1155,15 @@ class _DialogueConnection:
         url = _dialogue_stream_url(self._opts)
         headers = {AUTHORIZATION_HEADER: self._opts.api_key}
         self._ws = await self._session.ws_connect(url, headers=headers)
-        await self._ws.send_json(_build_dialogue_init_packet(self._opts))
+        try:
+            await self._ws.send_json(_build_dialogue_init_packet(self._opts))
+        except BaseException:
+            # a failed or cancelled init send must not leak the fresh websocket
+            self._closed = True
+            ws, self._ws = self._ws, None
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(ws.close())
+            raise
         self._last_activity = asyncio.get_event_loop().time()
 
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -1168,7 +1178,12 @@ class _DialogueConnection:
         timeout: float,
     ) -> _DialogueTurn:
         """Acquire the connection for one synthesis turn (turns are serialized)"""
-        await self._turn_lock.acquire()
+        try:
+            await asyncio.wait_for(self._turn_lock.acquire(), timeout)
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError(
+                f"timed out waiting for the active dialogue turn after {timeout} seconds"
+            ) from e
         if self._closed or not self._ws or self._ws.closed:
             self._turn_lock.release()
             raise APIConnectionError("dialogue websocket connection is closed")

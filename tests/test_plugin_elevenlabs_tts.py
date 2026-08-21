@@ -643,3 +643,43 @@ async def test_dialogue_connection_not_published_when_family_switched_mid_handsh
 
     assert closed == [True]
     assert tts._TTS__current_connection is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_start_turn_times_out_when_turn_is_held() -> None:
+    connection, ws = _make_dialogue_connection()
+    turn = await _make_dialogue_turn(connection)
+
+    waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+    with pytest.raises(elevenlabs_tts.APITimeoutError):
+        await connection.start_turn(
+            emitter=_FakeEmitter(), stream=None, waiter=waiter, timeout=0.05
+        )
+
+    connection.finish_turn(turn)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_connect_closes_socket_when_init_send_fails() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3_conversational")
+    ws = _FakeDialogueWebSocket()
+
+    async def _failing_send_json(data: dict[str, object]) -> None:
+        raise RuntimeError("init rejected")
+
+    ws.send_json = _failing_send_json  # type: ignore[method-assign]
+
+    class _FakeSession:
+        async def ws_connect(self, url: str, headers: dict[str, str]) -> _FakeDialogueWebSocket:
+            return ws
+
+    connection = elevenlabs_tts._DialogueConnection(  # pyright: ignore[reportPrivateUsage]
+        tts._opts, _FakeSession()
+    )
+
+    with pytest.raises(RuntimeError):
+        await connection.connect()
+
+    assert ws.closed
+    assert connection._closed
+    assert connection._ws is None
