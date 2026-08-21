@@ -22,6 +22,7 @@ import json
 import os
 import time
 import weakref
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any, Literal
@@ -95,6 +96,14 @@ DEFAULT_VOICE_ID = "hpp4J3VqNfWAUOO0d1Us"
 API_BASE_URL_V1 = "https://api.elevenlabs.io/v1"
 AUTHORIZATION_HEADER = "xi-api-key"
 WS_INACTIVITY_TIMEOUT = 180
+# the dialogue websocket closes after ~20s without client messages; keep_alive resets the timer
+_DIALOGUE_KEEP_ALIVE_INTERVAL = 10
+
+
+def _is_dialogue_model(model: TTSModels | str) -> bool:
+    # eleven_v3 models are rejected by the multi-stream endpoint (403 at handshake)
+    # and only stream over the text-to-dialogue websocket
+    return str(model).startswith("eleven_v3")
 
 
 class TTS(tts.TTS):
@@ -207,10 +216,14 @@ class TTS(tts.TTS):
             pronunciation_dictionary_locators=pronunciation_dictionary_locators,
         )
         self._session = http_session
-        self._streams = weakref.WeakSet[SynthesizeStream]()
+        self._streams = weakref.WeakSet[SynthesizeStream | ChunkedStream]()
 
-        self.__current_connection: _Connection | None = None
+        self.__current_connection: _Connection | _DialogueConnection | None = None
         self._connection_lock = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._prewarm_task: asyncio.Task[None] | None = None
+        self._closing = False
+        self._opts_generation = 0
 
     @property
     def model(self) -> str:
@@ -275,17 +288,22 @@ class TTS(tts.TTS):
             self._opts.pronunciation_dictionary_locators = pronunciation_dictionary_locators
             changed = True
 
-        if changed and self.__current_connection:
-            self.__current_connection.mark_non_current()
-            self.__current_connection = None
+        if changed:
+            self._opts_generation += 1
+            if self.__current_connection:
+                self.__current_connection.mark_non_current()
+                self.__current_connection = None
 
-    async def _current_connection(self) -> tuple[_Connection, float, bool]:
+    async def _current_connection(self) -> tuple[_Connection | _DialogueConnection, float, bool]:
         """Get the current connection, creating one if needed.
 
         Returns:
             Tuple of (connection, acquire_time, connection_reused)
         """
         async with self._connection_lock:
+            if self._closing:
+                raise APIConnectionError("TTS instance is closed", retryable=False)
+
             if (
                 self.__current_connection
                 and self.__current_connection.is_current
@@ -294,17 +312,67 @@ class TTS(tts.TTS):
                 return self.__current_connection, 0.0, True
 
             session = self._ensure_session()
-            conn = _Connection(self._opts, session)
+            generation = self._opts_generation
+            conn: _Connection | _DialogueConnection
+            if _is_dialogue_model(self._opts.model):
+                conn = _DialogueConnection(self._opts, session, spawn=self._spawn_background)
+            else:
+                conn = _Connection(self._opts, session)
             t0 = time.perf_counter()
             await conn.connect()
             acquire_time = time.perf_counter() - t0
+
+            if self._closing:
+                # aclose() may have run while the handshake was in flight; close the
+                # fresh connection instead of publishing it on a closed instance.
+                # spawn the close so the caller's acquisition timeout cannot cancel
+                # it halfway and leave a half-closed connection behind
+                self._spawn_background(conn.aclose())
+                raise APIConnectionError("TTS instance is closed", retryable=False)
+
+            if generation != self._opts_generation:
+                # update_options() ran during the handshake and could not mark the
+                # unpublished connection non-current; its URL and init message were
+                # built from the stale options (this also covers model-family
+                # switches). Discard it; the retry rebuilds from current options.
+                self._spawn_background(conn.aclose())
+                raise APIConnectionError("options changed while connecting")
+
             self.__current_connection = conn
             return conn, acquire_time, False
+
+    def _discard_dialogue_connection(self, connection: _DialogueConnection) -> None:
+        """Close a dialogue connection and warm a replacement in the background.
+
+        Closing the socket is the only way to stop in-flight v3 synthesis, so this is
+        the interruption path; the background reconnect keeps the next turn warm.
+        """
+        if self.__current_connection is connection:
+            self.__current_connection = None
+        connection.mark_non_current()  # spawns the close now that the turn is released
+        if self._closing:
+            # a stream woken by shutdown must not schedule a replacement connection
+            return
+        if self._prewarm_task is not None and not self._prewarm_task.done():
+            self._prewarm_task.cancel()
+        self._prewarm_task = asyncio.create_task(self._prewarm_dialogue())
+
+    async def _prewarm_dialogue(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._current_connection()
+
+    def _spawn_background(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[None]:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
     ) -> ChunkedStream:
-        return ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+        stream = ChunkedStream(tts=self, input_text=text, conn_options=conn_options)
+        self._streams.add(stream)
+        return stream
 
     def stream(
         self, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -314,13 +382,28 @@ class TTS(tts.TTS):
         return stream
 
     async def aclose(self) -> None:
+        self._closing = True
+
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
 
+        if self._prewarm_task is not None:
+            self._prewarm_task.cancel()
+
+        # connection close tasks must complete, not be cancelled: a close interrupted
+        # after it marks the connection closed would leave the websocket and its
+        # recv/keep-alive tasks alive past shutdown
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
+
         if self.__current_connection:
             await self.__current_connection.aclose()
             self.__current_connection = None
+
+        # sweep close tasks spawned while the streams above were shutting down
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -332,6 +415,12 @@ class ChunkedStream(tts.ChunkedStream):
         self._opts = replace(tts._opts)
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        # route on the snapshotted model so one request never mixes protocols when
+        # update_options() switches the model family concurrently
+        if _is_dialogue_model(self._opts.model):
+            await self._run_dialogue(output_emitter)
+            return
+
         voice_settings = (
             _strip_nones(dataclasses.asdict(self._opts.voice_settings))
             if is_given(self._opts.voice_settings)
@@ -390,6 +479,45 @@ class ChunkedStream(tts.ChunkedStream):
         except Exception as e:
             raise APIConnectionError() from e
 
+    async def _run_dialogue(self, output_emitter: tts.AudioEmitter) -> None:
+        """Synthesize via the dialogue websocket as a single one-shot turn"""
+        (
+            connection,
+            self._acquire_time,
+            self._connection_reused,
+        ) = await _acquire_dialogue_connection(self._tts, self._conn_options)
+
+        output_emitter.initialize(
+            request_id=utils.shortuuid(),
+            sample_rate=self._opts.sample_rate,
+            num_channels=1,
+            mime_type=_encoding_to_mimetype(self._opts.encoding),
+        )
+
+        waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+        turn = await connection.start_turn(
+            emitter=output_emitter, stream=None, waiter=waiter, timeout=self._conn_options.timeout
+        )
+
+        clean = False
+        try:
+            if self._input_text:
+                await connection.send_text(turn, self._input_text)
+            await connection.end_turn_input(turn)
+            await waiter
+            output_emitter.flush()
+            clean = True
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError() from e
+        except APIError:
+            raise
+        except Exception as e:
+            raise APIConnectionError("elevenlabs dialogue synthesis failed") from e
+        finally:
+            connection.finish_turn(turn)
+            if not clean:
+                self._tts._discard_dialogue_connection(connection)
+
 
 class SynthesizeStream(tts.SynthesizeStream):
     """Streamed API using websockets
@@ -412,6 +540,12 @@ class SynthesizeStream(tts.SynthesizeStream):
         await super().aclose()
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        # route on the snapshotted model so one request never mixes protocols when
+        # update_options() switches the model family concurrently
+        if _is_dialogue_model(self._opts.model):
+            await self._run_dialogue(output_emitter)
+            return
+
         self._context_id = utils.shortuuid()
         self._text_buffer = ""
         self._start_times_ms = []
@@ -428,9 +562,8 @@ class SynthesizeStream(tts.SynthesizeStream):
         )
         output_emitter.start_segment(segment_id=self._context_id)
 
-        connection: _Connection
         try:
-            connection, self._acquire_time, self._connection_reused = await asyncio.wait_for(
+            conn, self._acquire_time, self._connection_reused = await asyncio.wait_for(
                 self._tts._current_connection(), self._conn_options.timeout
             )
         except asyncio.TimeoutError as e:
@@ -441,8 +574,21 @@ class SynthesizeStream(tts.SynthesizeStream):
                 status_code=e.status,
                 request_id=trace_id_from_headers(e.headers),
             ) from e
+        except APIError:
+            # preserve deliberate errors (e.g. non-retryable closed-instance failures)
+            raise
         except Exception as e:
             raise APIConnectionError("could not connect to ElevenLabs") from e
+
+        if not isinstance(conn, _Connection):
+            # update_options() switched the model family while this request was starting; the
+            # request keeps its snapshotted model, so retrying can never match - fail fast
+            raise APIConnectionError(
+                "model family changed while starting synthesis; create a new stream after "
+                "switching between eleven_v3 and other models",
+                retryable=False,
+            )
+        connection: _Connection = conn
 
         waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
         connection.register_stream(self, output_emitter, waiter)
@@ -520,6 +666,84 @@ class SynthesizeStream(tts.SynthesizeStream):
                 with contextlib.suppress(Exception):
                     connection.close_context(self._context_id)
             await sent_tokenizer_stream.aclose()
+
+    async def _run_dialogue(self, output_emitter: tts.AudioEmitter) -> None:
+        """Stream via the dialogue websocket: one synthesis turn on the shared connection"""
+        request_id = utils.shortuuid()
+        self._text_buffer = ""
+        self._start_times_ms = []
+        self._durations_ms = []
+
+        sent_tokenizer_stream = self._opts.word_tokenizer.stream()
+
+        output_emitter.initialize(
+            request_id=request_id,
+            sample_rate=self._opts.sample_rate,
+            num_channels=1,
+            stream=True,
+            mime_type=_encoding_to_mimetype(self._opts.encoding),
+        )
+        output_emitter.start_segment(segment_id=request_id)
+
+        connection: _DialogueConnection
+        (
+            connection,
+            self._acquire_time,
+            self._connection_reused,
+        ) = await _acquire_dialogue_connection(self._tts, self._conn_options)
+
+        waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+        turn = await connection.start_turn(
+            emitter=output_emitter, stream=self, waiter=waiter, timeout=self._conn_options.timeout
+        )
+
+        async def _input_task() -> None:
+            async for data in self._input_ch:
+                if isinstance(data, self._FlushSentinel):
+                    sent_tokenizer_stream.flush()
+                    continue
+                sent_tokenizer_stream.push_text(data)
+            sent_tokenizer_stream.end_input()
+
+        async def _sentence_stream_task() -> None:
+            # the server streams naturally once ~40 chars are buffered; an explicit
+            # flush is only needed at the end of input to force out the short tail
+            async for data in sent_tokenizer_stream:
+                await connection.send_text(turn, f"{data.token} ")
+                self._mark_started()
+            await connection.end_turn_input(turn)
+
+        input_t = asyncio.create_task(_input_task())
+        stream_t = asyncio.create_task(_sentence_stream_task())
+
+        def _fail_waiter_on_error(task: asyncio.Task[None]) -> None:
+            # a producer failure (e.g. the final flush send) may leave no timer armed;
+            # forward it so the stream cannot hang holding the active turn
+            if task.cancelled():
+                return
+            if (exc := task.exception()) is not None and not waiter.done():
+                waiter.set_exception(exc)
+
+        input_t.add_done_callback(_fail_waiter_on_error)
+        stream_t.add_done_callback(_fail_waiter_on_error)
+
+        clean = False
+        try:
+            await waiter
+            clean = True
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError() from e
+        except APIError:
+            raise
+        except Exception as e:
+            raise APIStatusError("Could not synthesize") from e
+        finally:
+            output_emitter.end_segment()
+            await utils.aio.gracefully_cancel(input_t, stream_t)
+            await sent_tokenizer_stream.aclose()
+            connection.finish_turn(turn)
+            if not clean:
+                self._tts._discard_dialogue_connection(connection)
 
 
 @dataclass
@@ -619,18 +843,7 @@ class _Connection:
 
     @cached_property
     def preferred_alignment(self) -> Literal["normalized", "original"]:
-        if is_given(self._opts.preferred_alignment):
-            preferred_alignment = self._opts.preferred_alignment
-        else:
-            if is_given(self._opts.language) and self._opts.language.language in {
-                "ja",
-                "ko",
-                "zh",
-            }:
-                preferred_alignment = "original"
-            else:
-                preferred_alignment = "normalized"
-        return preferred_alignment
+        return _resolve_preferred_alignment(self._opts)
 
     def mark_non_current(self) -> None:
         """Mark this connection as no longer current - it will shut down when drained"""
@@ -889,6 +1102,453 @@ class _Connection:
         self._ws = None
 
 
+@dataclass
+class _DialogueTurn:
+    """State for the single active synthesis turn on a dialogue connection"""
+
+    emitter: tts.AudioEmitter
+    stream: SynthesizeStream | None
+    waiter: asyncio.Future[None]
+    voice_id: str
+    timeout: float
+    flushes_sent: int = 0
+    markers_received: int = 0
+    dirty: bool = False
+    started_input: bool = False
+    input_done: bool = False
+    timeout_timer: asyncio.TimerHandle | None = None
+
+
+class _DialogueConnection:
+    """Manages a single text-to-dialogue WebSocket for eleven_v3 models.
+
+    The dialogue endpoint has no per-context multiplexing and no cancellation
+    message: a new turn never stops in-flight synthesis, only closing the socket
+    does. The server emits exactly one ``is_final_audio_for_turn`` per flush that
+    had pending text, so a turn is complete when its flush count is matched. The
+    connection is reused across consecutive synthesis turns and kept open with
+    ``keep_alive`` messages (the server idles out after ~20s otherwise);
+    interruption closes the socket (see ``TTS._discard_dialogue_connection``).
+
+    Lifecycle invariants (three actors touch shared state - requests,
+    ``update_options()``, and ``aclose()`` - so every rule below matters):
+
+    1. Publish: a connection becomes the TTS instance's current connection only
+       inside ``_connection_lock``, and only if the instance is not closing and
+       ``_opts_generation`` is unchanged since before its construction, both
+       re-checked after the handshake await. A published connection therefore
+       always matches the live options.
+    2. Supersede: whoever makes a connection non-current triggers its close -
+       ``mark_non_current`` closes it when idle, ``finish_turn`` closes it after
+       the active turn drains, and the keep-alive loop is the backstop for the
+       no-running-loop edge of ``mark_non_current``.
+    3. Close: ``aclose`` is idempotent; discard closes are spawned through the
+       owner's tracked background set so an acquisition timeout can never cancel
+       one halfway, and ``TTS.aclose`` awaits them (plus a second sweep for
+       closes spawned by streams woken during shutdown).
+    4. Turns: the ``_turn_lock`` holder owns the turn and always calls
+       ``finish_turn`` exactly once from its ``finally``; turns never start on a
+       closed or superseded connection; every waiter-resolution path checks
+       ``waiter.done()`` first.
+    5. Bounded waits: connection acquisition, turn-lock acquisition, and every
+       websocket write are bounded by the request timeout; a timer bounds the
+       wait for first audio, and after input ends a stall timer (re-armed per
+       audio message) bounds the wait for the final marker.
+
+    Mutations of the current-connection slot happen either under
+    ``_connection_lock`` or in synchronous methods with no await between check
+    and write, which is equivalent on a single event loop.
+    """
+
+    def __init__(
+        self,
+        opts: _TTSOptions,
+        session: aiohttp.ClientSession,
+        *,
+        spawn: Callable[[Coroutine[Any, Any, Any]], asyncio.Task[None]] | None = None,
+    ):
+        self._opts = opts
+        self._session = session
+        # owner-provided task spawner so close tasks can be awaited at TTS shutdown
+        self._spawn = spawn
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._is_current = True
+        self._closed = False
+        self._turn: _DialogueTurn | None = None
+        self._turn_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._recv_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closed_done = asyncio.Event()
+        self._last_activity = 0.0
+
+    @property
+    def is_current(self) -> bool:
+        return self._is_current
+
+    @cached_property
+    def preferred_alignment(self) -> Literal["normalized", "original"]:
+        return _resolve_preferred_alignment(self._opts)
+
+    def mark_non_current(self) -> None:
+        """Mark this connection as superseded; it closes once idle so sockets don't linger"""
+        self._is_current = False
+        if self._turn is None:
+            self._spawn_close()
+
+    def _spawn_close(self) -> None:
+        if self._closed or (self._close_task is not None and not self._close_task.done()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop; the keep-alive loop closes it instead
+        coro = self.aclose()
+        self._close_task = self._spawn(coro) if self._spawn is not None else loop.create_task(coro)
+
+    async def connect(self) -> None:
+        """Establish the WebSocket, send the init message, and start recv/keep-alive loops"""
+        if self._ws or self._closed:
+            return
+
+        url = _dialogue_stream_url(self._opts)
+        headers = {AUTHORIZATION_HEADER: self._opts.api_key}
+        self._ws = await self._session.ws_connect(url, headers=headers)
+        try:
+            await self._ws.send_json(_build_dialogue_init_packet(self._opts))
+        except BaseException:
+            # a failed or cancelled init send must not leak the fresh websocket
+            self._closed = True
+            ws, self._ws = self._ws, None
+            try:
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(ws.close())
+            finally:
+                self._closed_done.set()
+            raise
+        self._last_activity = asyncio.get_event_loop().time()
+
+        self._recv_task = asyncio.create_task(self._recv_loop())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    async def start_turn(
+        self,
+        *,
+        emitter: tts.AudioEmitter,
+        stream: SynthesizeStream | None,
+        waiter: asyncio.Future[None],
+        timeout: float,
+    ) -> _DialogueTurn:
+        """Acquire the connection for one synthesis turn (turns are serialized)"""
+        try:
+            await asyncio.wait_for(self._turn_lock.acquire(), timeout)
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError(
+                f"timed out waiting for the active dialogue turn after {timeout} seconds"
+            ) from e
+        if self._closed or not self._is_current or not self._ws or self._ws.closed:
+            # a superseded connection embodies stale options and closes as soon as it
+            # drains; failing here lets the retry acquire a fresh one instead of
+            # sending a turn to a socket that is about to disappear
+            self._turn_lock.release()
+            raise APIConnectionError("dialogue websocket connection is closed")
+
+        turn = _DialogueTurn(
+            emitter=emitter,
+            stream=stream,
+            waiter=waiter,
+            voice_id=self._opts.voice_id,
+            timeout=timeout,
+        )
+        self._turn = turn
+        self._last_activity = asyncio.get_event_loop().time()
+        return turn
+
+    async def send_text(self, turn: _DialogueTurn, text: str) -> None:
+        pkt = {
+            "inputs": [
+                {"text": text, "voice_id": turn.voice_id, "new_turn": not turn.started_input}
+            ]
+        }
+        turn.started_input = True
+        turn.dirty = True
+        self._start_timeout_timer(turn)
+        await self._send_json(pkt, timeout=turn.timeout)
+
+    async def flush_turn(self, turn: _DialogueTurn) -> None:
+        # a flush with no pending text produces no marker; skip it so the
+        # marker count stays exact
+        if not turn.dirty:
+            return
+        turn.dirty = False
+        turn.flushes_sent += 1
+        await self._send_json({"flush": True}, timeout=turn.timeout)
+
+    async def end_turn_input(self, turn: _DialogueTurn) -> None:
+        await self.flush_turn(turn)
+        turn.input_done = True
+        self._maybe_complete_turn(turn)
+        if not turn.waiter.done():
+            # from here on audio must keep flowing until the final marker; without this
+            # the client keep_alive defeats the server idle close and a stall would
+            # hang the turn forever
+            self._arm_stall_timer(turn)
+
+    def finish_turn(self, turn: _DialogueTurn) -> None:
+        """Release the connection; always called by the turn holder when its run ends"""
+        if self._turn is turn:
+            self._turn = None
+        if turn.timeout_timer:
+            turn.timeout_timer.cancel()
+        self._last_activity = asyncio.get_event_loop().time()
+        if self._turn_lock.locked():
+            self._turn_lock.release()
+        if not self._is_current:
+            self._spawn_close()
+
+    async def _send_json(self, data: dict[str, Any], *, timeout: float | None = None) -> None:
+        if self._closed or not self._ws or self._ws.closed:
+            raise APIConnectionError("dialogue websocket connection is closed")
+        ws = self._ws
+
+        async def _locked_send() -> None:
+            async with self._send_lock:
+                await ws.send_json(data)
+
+        if timeout is None:
+            await _locked_send()
+            return
+        try:
+            # bound the lock acquisition and the write together: a backpressured
+            # writer holding the lock must not extend another turn's budget, and a
+            # stalled write must not hold the turn forever; the resulting error
+            # discards the connection
+            await asyncio.wait_for(_locked_send(), timeout)
+        except asyncio.TimeoutError as e:
+            raise APITimeoutError(f"11labs dialogue send stalled after {timeout} seconds") from e
+
+    def _maybe_complete_turn(self, turn: _DialogueTurn) -> None:
+        if not turn.input_done or turn.markers_received < turn.flushes_sent:
+            return
+        if turn.waiter.done():
+            return
+
+        if turn.stream is not None:
+            timed_words, _ = _to_timed_words(
+                turn.stream._text_buffer,
+                turn.stream._start_times_ms,
+                turn.stream._durations_ms,
+                flush=True,
+            )
+            turn.emitter.push_timed_transcript(timed_words)
+
+        turn.waiter.set_result(None)
+        if turn.timeout_timer:
+            turn.timeout_timer.cancel()
+        self._turn = None
+        self._last_activity = asyncio.get_event_loop().time()
+
+    def _start_timeout_timer(self, turn: _DialogueTurn) -> None:
+        """Time out if no audio arrives for the turn; cancelled on first audio"""
+        if turn.timeout_timer:
+            return
+
+        def _on_timeout() -> None:
+            if not turn.waiter.done():
+                turn.waiter.set_exception(
+                    APITimeoutError(f"11labs tts timed out after {turn.timeout} seconds")
+                )
+
+        turn.timeout_timer = asyncio.get_event_loop().call_later(turn.timeout, _on_timeout)
+
+    def _arm_stall_timer(self, turn: _DialogueTurn) -> None:
+        """After input ends, time out if audio stops flowing before the final marker"""
+        if turn.timeout_timer:
+            turn.timeout_timer.cancel()
+
+        def _on_stall() -> None:
+            if not turn.waiter.done():
+                turn.waiter.set_exception(
+                    APITimeoutError(
+                        f"11labs tts stalled after input end ({turn.timeout} seconds without audio)"
+                    )
+                )
+
+        turn.timeout_timer = asyncio.get_event_loop().call_later(turn.timeout, _on_stall)
+
+    async def _recv_loop(self) -> None:
+        """Receive loop - routes audio, alignment, and turn markers to the active turn"""
+        try:
+            while not self._closed and self._ws and not self._ws.closed:
+                msg = await self._ws.receive()
+
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    turn = self._turn
+                    if turn is not None and not turn.waiter.done():
+                        raise APIStatusError(
+                            "ElevenLabs dialogue websocket closed unexpectedly",
+                            status_code=self._ws.close_code or -1,
+                        )
+                    break
+
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    logger.warning("unexpected message type %s", msg.type)
+                    continue
+
+                data = json.loads(msg.data)
+                turn = self._turn
+
+                if error := (data.get("error") or data.get("message")):
+                    if turn is None and data.get("error") == "input_timeout_exceeded":
+                        # expected when the connection idles out between turns
+                        logger.debug("elevenlabs dialogue connection idled out")
+                        break
+
+                    logger.error(
+                        "elevenlabs dialogue tts returned error",
+                        extra={"error": error, "data": data},
+                    )
+                    if turn is not None and not turn.waiter.done():
+                        turn.waiter.set_exception(
+                            APIStatusError(str(error), status_code=data.get("code") or -1)
+                        )
+                    break
+
+                if data.get("audio"):
+                    if turn is None:
+                        # with exact flush accounting this should not happen; treat the
+                        # connection as poisoned rather than risk emitting stale audio
+                        logger.warning(
+                            "elevenlabs dialogue tts sent audio with no active turn, "
+                            "closing connection"
+                        )
+                        break
+                    turn.emitter.push(base64.b64decode(data["audio"]))
+                    if turn.timeout_timer:
+                        turn.timeout_timer.cancel()
+                    if turn.input_done and not turn.waiter.done():
+                        self._arm_stall_timer(turn)
+
+                if turn is not None and turn.stream is not None:
+                    alignment = (
+                        data.get("normalized_alignment") or data.get("normalizedAlignment")
+                        if self.preferred_alignment == "normalized"
+                        else data.get("alignment")
+                    )
+                    if alignment:
+                        _push_dialogue_alignment(turn.stream, turn.emitter, alignment)
+
+                if data.get("is_final_audio_for_turn") and turn is not None:
+                    turn.markers_received += 1
+                    self._maybe_complete_turn(turn)
+
+                if data.get("is_final"):
+                    break
+        except Exception as e:
+            turn = self._turn
+            if turn is not None and not turn.waiter.done():
+                turn.waiter.set_exception(e)
+            self._turn = None
+        finally:
+            if not self._closed:
+                await self.aclose()
+
+    async def _keepalive_loop(self) -> None:
+        """Keep the socket alive between turns; drop it after ``inactivity_timeout`` idle"""
+        try:
+            while not self._closed and self._ws and not self._ws.closed:
+                await asyncio.sleep(_DIALOGUE_KEEP_ALIVE_INTERVAL)
+                if self._turn is None and not self._is_current:
+                    break
+                if (
+                    self._turn is None
+                    and asyncio.get_event_loop().time() - self._last_activity
+                    >= self._opts.inactivity_timeout
+                ):
+                    logger.debug("closing idle elevenlabs dialogue connection")
+                    self.mark_non_current()
+                    break
+                try:
+                    await self._send_json(
+                        {"keep_alive": True}, timeout=_DIALOGUE_KEEP_ALIVE_INTERVAL
+                    )
+                except APIError:
+                    break
+        finally:
+            if not self._closed:
+                await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the connection and clean up"""
+        if self._closed:
+            # another task started the close; join its cleanup instead of treating
+            # the flag as proof that cleanup already finished. The recv/keep-alive
+            # finallys skip aclose() once _closed is set, so nothing here can end
+            # up waiting on its own completion.
+            await self._closed_done.wait()
+            return
+
+        self._closed = True
+
+        try:
+            turn = self._turn
+            if turn is not None:
+                if not turn.waiter.done():
+                    turn.waiter.set_exception(APIStatusError("connection closed"))
+                if turn.timeout_timer:
+                    turn.timeout_timer.cancel()
+            self._turn = None
+
+            if self._ws:
+                await self._ws.close()
+
+            current = asyncio.current_task()
+            for task in (self._recv_task, self._keepalive_task):
+                if task is not None and task is not current:
+                    await utils.aio.gracefully_cancel(task)
+
+            self._ws = None
+        finally:
+            self._closed_done.set()
+
+
+async def _acquire_dialogue_connection(
+    tts_inst: TTS, conn_options: APIConnectOptions
+) -> tuple[_DialogueConnection, float, bool]:
+    try:
+        connection, acquire_time, reused = await asyncio.wait_for(
+            tts_inst._current_connection(), conn_options.timeout
+        )
+    except asyncio.TimeoutError as e:
+        raise APITimeoutError() from e
+    except aiohttp.WSServerHandshakeError as e:
+        raise APIStatusError(
+            message=e.message,
+            status_code=e.status,
+            request_id=trace_id_from_headers(e.headers),
+        ) from e
+    except APIError:
+        # preserve deliberate errors (e.g. non-retryable closed-instance failures)
+        raise
+    except Exception as e:
+        raise APIConnectionError("could not connect to ElevenLabs") from e
+
+    if not isinstance(connection, _DialogueConnection):
+        # update_options() switched the model family while this request was starting; the
+        # request keeps its snapshotted model, so retrying can never match - fail fast
+        raise APIConnectionError(
+            "model family changed while starting synthesis; create a new stream after "
+            "switching between eleven_v3 and other models",
+            retryable=False,
+        )
+    return connection, acquire_time, reused
+
+
 def _dict_to_voices_list(data: dict[str, Any]) -> list[Voice]:
     voices: list[Voice] = []
     for voice in data["voices"]:
@@ -937,6 +1597,81 @@ def _multi_stream_url(opts: _TTSOptions) -> str:
         params.append(f"auto_mode={str(opts.auto_mode).lower()}")
     url += "&".join(params)
     return url
+
+
+def _dialogue_stream_url(opts: _TTSOptions) -> str:
+    base_url = opts.base_url.replace("https://", "wss://").replace("http://", "ws://")
+    params = [
+        f"model_id={opts.model}",
+        f"output_format={opts.encoding}",
+        f"apply_text_normalization={opts.apply_text_normalization}",
+        f"enable_logging={str(opts.enable_logging).lower()}",
+    ]
+    if is_given(opts.language):
+        params.append(f"language_code={opts.language.language}")
+    if opts.sync_alignment:
+        params.append("sync_alignment=true")
+    return f"{base_url}/text-to-dialogue/stream-input?" + "&".join(params)
+
+
+def _build_dialogue_init_packet(opts: _TTSOptions) -> dict[str, Any]:
+    # `voices` must be a list of plain voice-ID strings; voice_settings and
+    # pronunciation dictionaries are only accepted in this first message
+    init_pkt: dict[str, Any] = {"voices": [opts.voice_id]}
+    if is_given(opts.voice_settings):
+        init_pkt["voice_settings"] = _strip_nones(dataclasses.asdict(opts.voice_settings))
+    if is_given(opts.pronunciation_dictionary_locators):
+        init_pkt["pronunciation_dictionary_locators"] = [
+            {
+                "pronunciation_dictionary_id": locator.pronunciation_dictionary_id,
+                "version_id": locator.version_id,
+            }
+            for locator in opts.pronunciation_dictionary_locators
+        ]
+    return init_pkt
+
+
+def _resolve_preferred_alignment(opts: _TTSOptions) -> Literal["normalized", "original"]:
+    if is_given(opts.preferred_alignment):
+        return opts.preferred_alignment
+    if is_given(opts.language) and opts.language.language in {"ja", "ko", "zh"}:
+        return "original"
+    return "normalized"
+
+
+def _push_dialogue_alignment(
+    stream: SynthesizeStream, emitter: tts.AudioEmitter, alignment: dict[str, Any]
+) -> None:
+    """Feed one alignment payload (snake_case or camelCase keys) into the stream's timed words"""
+    chars = alignment.get("chars")
+    starts = (
+        alignment.get("char_start_times_ms")
+        or alignment.get("charStartTimesMs")
+        or alignment.get("charsStartTimesMs")
+    )
+    durs = (
+        alignment.get("char_durations_ms")
+        or alignment.get("charDurationsMs")
+        or alignment.get("charsDurationsMs")
+    )
+    if not (chars and starts and durs and len(chars) == len(durs) and len(starts) == len(durs)):
+        return
+
+    stream._text_buffer += "".join(chars)
+    # in case item in chars has multiple characters
+    for char, start, dur in zip(chars, starts, durs, strict=False):
+        if len(char) > 1:
+            stream._start_times_ms += [start] * (len(char) - 1)
+            stream._durations_ms += [0] * (len(char) - 1)
+        stream._start_times_ms.append(start)
+        stream._durations_ms.append(dur)
+
+    timed_words, stream._text_buffer = _to_timed_words(
+        stream._text_buffer, stream._start_times_ms, stream._durations_ms
+    )
+    emitter.push_timed_transcript(timed_words)
+    stream._start_times_ms = stream._start_times_ms[-len(stream._text_buffer) :]
+    stream._durations_ms = stream._durations_ms[-len(stream._text_buffer) :]
 
 
 def _to_timed_words(
