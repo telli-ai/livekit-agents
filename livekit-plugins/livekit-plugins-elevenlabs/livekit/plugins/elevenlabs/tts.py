@@ -470,7 +470,11 @@ class ChunkedStream(tts.ChunkedStream):
 
     async def _run_dialogue(self, output_emitter: tts.AudioEmitter) -> None:
         """Synthesize via the dialogue websocket as a single one-shot turn"""
-        connection, _, _ = await _acquire_dialogue_connection(self._tts, self._conn_options)
+        (
+            connection,
+            self._acquire_time,
+            self._connection_reused,
+        ) = await _acquire_dialogue_connection(self._tts, self._conn_options)
 
         output_emitter.initialize(
             request_id=utils.shortuuid(),
