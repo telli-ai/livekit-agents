@@ -524,3 +524,30 @@ async def test_dialogue_recv_loop_close_with_active_turn_sets_error() -> None:
 
     assert turn.waiter.done()
     assert isinstance(turn.waiter.exception(), elevenlabs_tts.APIStatusError)
+
+
+@pytest.mark.asyncio
+async def test_dialogue_mark_non_current_closes_idle_connection() -> None:
+    connection, ws = _make_dialogue_connection()
+
+    connection.mark_non_current()
+
+    assert connection._close_task is not None
+    await connection._close_task
+    assert connection._closed
+    assert ws.closed
+
+
+@pytest.mark.asyncio
+async def test_dialogue_finish_turn_closes_non_current_connection() -> None:
+    connection, ws = _make_dialogue_connection()
+    turn = await _make_dialogue_turn(connection)
+
+    connection.mark_non_current()
+    assert connection._close_task is None  # active turn keeps the socket open until drained
+
+    connection.finish_turn(turn)
+    assert connection._close_task is not None
+    await connection._close_task
+    assert connection._closed
+    assert ws.closed

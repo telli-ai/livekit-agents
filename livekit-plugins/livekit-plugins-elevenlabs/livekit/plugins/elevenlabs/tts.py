@@ -370,7 +370,9 @@ class ChunkedStream(tts.ChunkedStream):
         self._opts = replace(tts._opts)
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        if _is_dialogue_model(self._tts._opts.model):
+        # route on the snapshotted model so one request never mixes protocols when
+        # update_options() switches the model family concurrently
+        if _is_dialogue_model(self._opts.model):
             await self._run_dialogue(output_emitter)
             return
 
@@ -489,7 +491,9 @@ class SynthesizeStream(tts.SynthesizeStream):
         await super().aclose()
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
-        if _is_dialogue_model(self._tts._opts.model):
+        # route on the snapshotted model so one request never mixes protocols when
+        # update_options() switches the model family concurrently
+        if _is_dialogue_model(self._opts.model):
             await self._run_dialogue(output_emitter)
             return
 
@@ -1069,6 +1073,7 @@ class _DialogueConnection:
         self._send_lock = asyncio.Lock()
         self._recv_task: asyncio.Task[None] | None = None
         self._keepalive_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._last_activity = 0.0
 
     @property
@@ -1080,8 +1085,19 @@ class _DialogueConnection:
         return _resolve_preferred_alignment(self._opts)
 
     def mark_non_current(self) -> None:
-        """Mark this connection as no longer current - the next stream reconnects"""
+        """Mark this connection as superseded; it closes once idle so sockets don't linger"""
         self._is_current = False
+        if self._turn is None:
+            self._spawn_close()
+
+    def _spawn_close(self) -> None:
+        if self._closed or (self._close_task is not None and not self._close_task.done()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no running loop; the keep-alive loop closes it instead
+        self._close_task = loop.create_task(self.aclose())
 
     async def connect(self) -> None:
         """Establish the WebSocket, send the init message, and start recv/keep-alive loops"""
@@ -1156,6 +1172,8 @@ class _DialogueConnection:
         self._last_activity = asyncio.get_event_loop().time()
         if self._turn_lock.locked():
             self._turn_lock.release()
+        if not self._is_current:
+            self._spawn_close()
 
     async def _send_json(self, data: dict[str, Any]) -> None:
         if self._closed or not self._ws or self._ws.closed:
@@ -1281,6 +1299,8 @@ class _DialogueConnection:
         try:
             while not self._closed and self._ws and not self._ws.closed:
                 await asyncio.sleep(_DIALOGUE_KEEP_ALIVE_INTERVAL)
+                if self._turn is None and not self._is_current:
+                    break
                 if (
                     self._turn is None
                     and asyncio.get_event_loop().time() - self._last_activity
