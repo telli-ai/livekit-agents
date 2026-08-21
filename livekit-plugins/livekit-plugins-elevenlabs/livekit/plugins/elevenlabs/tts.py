@@ -705,6 +705,17 @@ class SynthesizeStream(tts.SynthesizeStream):
         input_t = asyncio.create_task(_input_task())
         stream_t = asyncio.create_task(_sentence_stream_task())
 
+        def _fail_waiter_on_error(task: asyncio.Task[None]) -> None:
+            # a producer failure (e.g. the final flush send) may leave no timer armed;
+            # forward it so the stream cannot hang holding the active turn
+            if task.cancelled():
+                return
+            if (exc := task.exception()) is not None and not waiter.done():
+                waiter.set_exception(exc)
+
+        input_t.add_done_callback(_fail_waiter_on_error)
+        stream_t.add_done_callback(_fail_waiter_on_error)
+
         clean = False
         try:
             await waiter
