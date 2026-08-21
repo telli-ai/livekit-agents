@@ -613,6 +613,8 @@ async def test_dialogue_connection_not_published_when_closed_mid_handshake(
     with pytest.raises(elevenlabs_tts.APIConnectionError):
         await tts._current_connection()
 
+    if tts._background_tasks:  # the discard close is spawned, not awaited inline
+        await asyncio.gather(*tts._background_tasks)
     assert closed == [True]
     assert tts._TTS__current_connection is None  # type: ignore[attr-defined]
 
@@ -641,6 +643,8 @@ async def test_dialogue_connection_not_published_when_family_switched_mid_handsh
     with pytest.raises(elevenlabs_tts.APIConnectionError):
         await tts._current_connection()
 
+    if tts._background_tasks:  # the discard close is spawned, not awaited inline
+        await asyncio.gather(*tts._background_tasks)
     assert closed == [True]
     assert tts._TTS__current_connection is None  # type: ignore[attr-defined]
 
@@ -728,5 +732,24 @@ async def test_dialogue_connection_not_published_when_options_change_mid_handsha
     with pytest.raises(elevenlabs_tts.APIConnectionError):
         await tts._current_connection()
 
+    if tts._background_tasks:  # the discard close is spawned, not awaited inline
+        await asyncio.gather(*tts._background_tasks)
     assert closed == [True]
     assert tts._TTS__current_connection is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_send_times_out_when_write_stalls() -> None:
+    connection, ws = _make_dialogue_connection()
+    turn = await _make_dialogue_turn(connection)
+    turn.timeout = 0.05
+
+    async def _stalled_send(data: dict[str, object]) -> None:
+        await asyncio.Event().wait()
+
+    ws.send_json = _stalled_send  # type: ignore[method-assign]
+
+    with pytest.raises(elevenlabs_tts.APITimeoutError):
+        await connection.send_text(turn, "Hello. ")
+
+    connection.finish_turn(turn)

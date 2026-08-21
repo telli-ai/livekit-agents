@@ -324,8 +324,10 @@ class TTS(tts.TTS):
 
             if self._closing:
                 # aclose() may have run while the handshake was in flight; close the
-                # fresh connection instead of publishing it on a closed instance
-                await conn.aclose()
+                # fresh connection instead of publishing it on a closed instance.
+                # spawn the close so the caller's acquisition timeout cannot cancel
+                # it halfway and leave a half-closed connection behind
+                self._spawn_background(conn.aclose())
                 raise APIConnectionError("TTS instance is closed", retryable=False)
 
             if generation != self._opts_generation:
@@ -333,7 +335,7 @@ class TTS(tts.TTS):
                 # unpublished connection non-current; its URL and init message were
                 # built from the stale options (this also covers model-family
                 # switches). Discard it; the retry rebuilds from current options.
-                await conn.aclose()
+                self._spawn_background(conn.aclose())
                 raise APIConnectionError("options changed while connecting")
 
             self.__current_connection = conn
@@ -398,6 +400,10 @@ class TTS(tts.TTS):
         if self.__current_connection:
             await self.__current_connection.aclose()
             self.__current_connection = None
+
+        # sweep close tasks spawned while the streams above were shutting down
+        if self._background_tasks:
+            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -1231,7 +1237,7 @@ class _DialogueConnection:
         turn.started_input = True
         turn.dirty = True
         self._start_timeout_timer(turn)
-        await self._send_json(pkt)
+        await self._send_json(pkt, timeout=turn.timeout)
 
     async def flush_turn(self, turn: _DialogueTurn) -> None:
         # a flush with no pending text produces no marker; skip it so the
@@ -1240,7 +1246,7 @@ class _DialogueConnection:
             return
         turn.dirty = False
         turn.flushes_sent += 1
-        await self._send_json({"flush": True})
+        await self._send_json({"flush": True}, timeout=turn.timeout)
 
     async def end_turn_input(self, turn: _DialogueTurn) -> None:
         await self.flush_turn(turn)
@@ -1264,11 +1270,21 @@ class _DialogueConnection:
         if not self._is_current:
             self._spawn_close()
 
-    async def _send_json(self, data: dict[str, Any]) -> None:
+    async def _send_json(self, data: dict[str, Any], *, timeout: float | None = None) -> None:
         if self._closed or not self._ws or self._ws.closed:
             raise APIConnectionError("dialogue websocket connection is closed")
         async with self._send_lock:
-            await self._ws.send_json(data)
+            if timeout is None:
+                await self._ws.send_json(data)
+                return
+            try:
+                # a write stalled by transport backpressure must not hold the turn
+                # forever; the resulting error discards the connection
+                await asyncio.wait_for(self._ws.send_json(data), timeout)
+            except asyncio.TimeoutError as e:
+                raise APITimeoutError(
+                    f"11labs dialogue send stalled after {timeout} seconds"
+                ) from e
 
     def _maybe_complete_turn(self, turn: _DialogueTurn) -> None:
         if not turn.input_done or turn.markers_received < turn.flushes_sent:
@@ -1416,8 +1432,10 @@ class _DialogueConnection:
                     self.mark_non_current()
                     break
                 try:
-                    await self._send_json({"keep_alive": True})
-                except APIConnectionError:
+                    await self._send_json(
+                        {"keep_alive": True}, timeout=_DIALOGUE_KEEP_ALIVE_INTERVAL
+                    )
+                except APIError:
                     break
         finally:
             if not self._closed:
