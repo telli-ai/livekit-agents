@@ -683,3 +683,22 @@ async def test_dialogue_connect_closes_socket_when_init_send_fails() -> None:
     assert ws.closed
     assert connection._closed
     assert connection._ws is None
+
+
+@pytest.mark.asyncio
+async def test_dialogue_acquire_preserves_non_retryable_closed_error() -> None:
+    tts = elevenlabs_tts.TTS(
+        api_key="test-key",
+        model="eleven_v3_conversational",
+        http_session=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    tts._closing = True
+
+    from livekit.agents import DEFAULT_API_CONNECT_OPTIONS
+
+    with pytest.raises(elevenlabs_tts.APIConnectionError) as exc_info:
+        await elevenlabs_tts._acquire_dialogue_connection(  # pyright: ignore[reportPrivateUsage]
+            tts, DEFAULT_API_CONNECT_OPTIONS
+        )
+
+    assert exc_info.value.retryable is False

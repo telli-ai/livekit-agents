@@ -563,6 +563,9 @@ class SynthesizeStream(tts.SynthesizeStream):
                 status_code=e.status,
                 request_id=trace_id_from_headers(e.headers),
             ) from e
+        except APIError:
+            # preserve deliberate errors (e.g. non-retryable closed-instance failures)
+            raise
         except Exception as e:
             raise APIConnectionError("could not connect to ElevenLabs") from e
 
@@ -1445,6 +1448,9 @@ async def _acquire_dialogue_connection(
             status_code=e.status,
             request_id=trace_id_from_headers(e.headers),
         ) from e
+    except APIError:
+        # preserve deliberate errors (e.g. non-retryable closed-instance failures)
+        raise
     except Exception as e:
         raise APIConnectionError("could not connect to ElevenLabs") from e
 
