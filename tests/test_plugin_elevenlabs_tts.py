@@ -615,3 +615,31 @@ async def test_dialogue_connection_not_published_when_closed_mid_handshake(
 
     assert closed == [True]
     assert tts._TTS__current_connection is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_dialogue_connection_not_published_when_family_switched_mid_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tts = elevenlabs_tts.TTS(
+        api_key="test-key",
+        model="eleven_v3_conversational",
+        http_session=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    closed: list[bool] = []
+
+    async def _connect(self: object) -> None:
+        # update_options() cannot mark the unpublished connection non-current
+        tts.update_options(model="eleven_turbo_v2_5")
+
+    async def _aclose(self: object) -> None:
+        closed.append(True)
+
+    monkeypatch.setattr(elevenlabs_tts._DialogueConnection, "connect", _connect)
+    monkeypatch.setattr(elevenlabs_tts._DialogueConnection, "aclose", _aclose)
+
+    with pytest.raises(elevenlabs_tts.APIConnectionError):
+        await tts._current_connection()
+
+    assert closed == [True]
+    assert tts._TTS__current_connection is None  # type: ignore[attr-defined]

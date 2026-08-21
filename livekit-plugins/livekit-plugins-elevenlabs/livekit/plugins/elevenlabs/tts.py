@@ -324,6 +324,13 @@ class TTS(tts.TTS):
                 await conn.aclose()
                 raise APIConnectionError("TTS instance is closed", retryable=False)
 
+            if isinstance(conn, _DialogueConnection) != _is_dialogue_model(self._opts.model):
+                # update_options() switched the model family during the handshake and
+                # could not mark the unpublished connection non-current; publishing it
+                # would wedge every subsequent stream on a wrong-protocol connection
+                await conn.aclose()
+                raise APIConnectionError("model family changed while connecting")
+
             self.__current_connection = conn
             return conn, acquire_time, False
 
